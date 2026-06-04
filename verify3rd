@@ -1,0 +1,196 @@
+#include <iostream>
+#include <cstdlib>
+#include <cmath>
+#include <cstdint>
+#include <random>
+#include <vector>
+#include <omp.h>
+using namespace std;
+
+const int N = 257;
+const int ROUNDS = 5;            // 验证 5 轮
+const long TEST_NUM = 0x3ffffff;  
+
+// ---------- Subterranean 基本运算 ----------
+vector<unsigned int> Chi(const vector<unsigned int>& c) {
+    vector<unsigned int> res(N);
+    for (int u = 0; u < N; u++)
+        res[u] = c[u] ^ ((c[(u + 1) % N] ^ 1) & c[(u + 2) % N]);
+    return res;
+}
+
+vector<unsigned int> L1(vector<unsigned int> c) {
+    vector<unsigned int> temp(N);
+    for (int u = 0; u < N; u++)
+        temp[u] = c[u] ^ c[(u + 3) % N] ^ c[(u + 8) % N];
+    for (int u = 0; u < N; u++)
+        c[u] = temp[(12 * u) % N];
+    return c;
+}
+
+// ---------- 三阶实验验证----------
+void HD_L_3rd_iota(const vector<unsigned int>& diff1,
+                   const vector<unsigned int>& diff2,
+                   const vector<unsigned int>& diff3,
+                   int location, double &out_cor) {
+    long total_counter = 0;
+
+    #pragma omp parallel
+    {
+        random_device rd;
+        mt19937_64 gen(rd() ^ (omp_get_thread_num() << 16));
+        uniform_int_distribution<unsigned int> dis(0, 0xFFFFFFFF);
+
+        long thread_counter = 0;
+
+        #pragma omp for
+        for (long test = 0; test < TEST_NUM; test++) {
+            vector<unsigned int> state(N);
+            for (int i = 0; i < 8; i++) {
+                unsigned int a = dis(gen);
+                for (int j = 0; j < 32; j++)
+                    state[i * 32 + j] = (a >> j) & 1;
+            }
+            state[256] = dis(gen) & 1;
+
+            vector<unsigned int> s1(N), s2(N), s3(N);
+            vector<unsigned int> s12(N), s13(N), s23(N), s123(N);
+            for (int i = 0; i < N; i++) {
+                s1[i]   = state[i] ^ diff1[i];
+                s2[i]   = state[i] ^ diff2[i];
+                s3[i]   = state[i] ^ diff3[i];
+                s12[i]  = state[i] ^ diff1[i] ^ diff2[i];
+                s13[i]  = state[i] ^ diff1[i] ^ diff3[i];
+                s23[i]  = state[i] ^ diff2[i] ^ diff3[i];
+                s123[i] = state[i] ^ diff1[i] ^ diff2[i] ^ diff3[i];
+            }
+
+            for (int r = 0; r < ROUNDS; r++) {
+                state = Chi(state);
+                s1    = Chi(s1);
+                s2    = Chi(s2);
+                s3    = Chi(s3);
+                s12   = Chi(s12);
+                s13   = Chi(s13);
+                s23   = Chi(s23);
+                s123  = Chi(s123);
+
+                if (r == 0 || r == 2 || r == 3) {
+                    state[0] ^= 1;
+                    s1[0] ^= 1;
+                    s2[0] ^= 1;
+                    s3[0] ^= 1;
+                    s12[0] ^= 1;
+                    s13[0] ^= 1;
+                    s23[0] ^= 1;
+                    s123[0] ^= 1;
+                }
+
+                if (r < ROUNDS - 1) {
+                    state = L1(state);
+                    s1    = L1(s1);
+                    s2    = L1(s2);
+                    s3    = L1(s3);
+                    s12   = L1(s12);
+                    s13   = L1(s13);
+                    s23   = L1(s23);
+                    s123  = L1(s123);
+                }
+            }
+
+            bool approx = state[location] ^ s1[location] ^ s2[location] ^ s3[location] ^
+                          s12[location] ^ s13[location] ^ s23[location] ^ s123[location];
+            if (approx == 0)
+                thread_counter++;
+            else
+                thread_counter--;
+        }
+
+        #pragma omp atomic
+        total_counter += thread_counter;
+    }
+
+    out_cor = (double)total_counter / (double)TEST_NUM;
+}
+
+int main() {
+    omp_set_num_threads(40);
+    printf("Third-order DL verification (with iota) from p3=5 to 256\n");
+    printf("Using %d OpenMP threads, samples per test: %ld\n\n", omp_get_max_threads(), TEST_NUM);
+
+    int theo_bit[257];
+    for (int i = 0; i < 257; i++) theo_bit[i] = -1;   // 初始化为无效
+
+    // 已知的理论最优输出比特
+    theo_bit[1]  = 17;
+    theo_bit[2]  = 75;
+    theo_bit[3]  = 189;
+    theo_bit[4]  = 115;
+    theo_bit[5]  = 220;
+    theo_bit[6]  = 124;
+    theo_bit[7]  = 40;
+    theo_bit[8]  = 220;
+    theo_bit[9]  = 74;
+    theo_bit[10] = 40;
+    theo_bit[11] = 124;
+    theo_bit[12] = 40;
+    theo_bit[13] = 85;
+    theo_bit[14] = 172;
+    theo_bit[15] = 63;
+    theo_bit[16] = 130;
+    theo_bit[17] = 172;
+    theo_bit[18] = 29;
+    theo_bit[19] = 11;
+    theo_bit[20] = 241;
+    theo_bit[21] = 189;
+    theo_bit[22] = 168;
+    theo_bit[23] = 50;
+    theo_bit[24] = 120;
+    theo_bit[25] = 9;
+    theo_bit[26] = 70;
+    theo_bit[27] = 20;
+    theo_bit[28] = 39;
+    theo_bit[29] = 120;
+    theo_bit[30] = 116;
+    theo_bit[31] = 149;
+    theo_bit[33] = 13;
+    theo_bit[34] = 223;
+    theo_bit[35] = 115;
+    theo_bit[36] = 223;
+    theo_bit[37] = 123;
+
+
+    double global_best = 0.0;
+    int best_p3 = -1, best_outbit = -1;
+    double best_cor = 0.0;
+
+    vector<unsigned int> diff1(N, 0), diff2(N, 0);
+    diff1[0] = 1;
+    diff2[32] = 1;
+
+    for (int p3 = 5; p3 < N; p3++) {
+        if (p3 == 32) continue;
+        if (theo_bit[p3] < 0) continue;
+
+        vector<unsigned int> diff3(N, 0);
+        diff3[p3] = 1;
+
+        printf("Testing p3 = %d, output bit = %d\n", p3, theo_bit[p3]);
+        fflush(stdout);
+
+        double cor = 0.0;
+        HD_L_3rd_iota(diff1, diff2, diff3, theo_bit[p3], cor);
+
+        printf("p3 = %3d  cor = %+.6f  (log2: %.2f)\n", p3, cor, log2(fabs(cor)));
+        if (fabs(cor) > fabs(best_cor)) {
+            best_cor = cor;
+            best_p3 = p3;
+            best_outbit = theo_bit[p3];
+        }
+    }
+
+    printf("\nGlobal best: Diff1=[0] Diff2=[32] Diff3=[%d] -> output bit %d, cor = %+.6f (log2: %.2f)\n",
+           best_p3, best_outbit, best_cor, log2(fabs(best_cor)));
+
+    return 0;
+}
