@@ -1,0 +1,361 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <omp.h>
+
+#define N 257
+#define DIM 256          // 3 阶 CV 维度 (2^8)
+
+/* 4 个基础 2x2 矩阵 */
+static const double M00[4] = { 0.5, 0.5, 0.5, 0.5 };
+static const double M01[4] = { 0.5, -0.5, 0.5, -0.5 };
+static const double M10[4] = { 0.5, 0.5, -0.5, 0.5 };
+static const double M11[4] = { 0.5, -0.5, -0.5, -0.5 };
+static const double* MT[4] = { M00, M01, M10, M11 };
+
+/* 快速 Walsh-Hadamard 变换 */
+static void fwt(double* v, int len) {
+    for (int h = 1; h < len; h <<= 1) {
+        for (int i = 0; i < len; i += 2 * h) {
+            for (int j = i; j < i + h; j++) {
+                double x = v[j];
+                double y = v[j + h];
+                v[j] = x + y;
+                v[j + h] = x - y;
+            }
+        }
+    }
+}
+
+/* 构建线性矩阵 M (257 x 257) */
+static int** getLinearMatrix(void) {
+    int** M = malloc(N * sizeof(int*));
+    for (int i = 0; i < N; i++) {
+        M[i] = calloc(N, sizeof(int));
+    }
+    for (int unit = 0; unit < N; unit++) {
+        int x[N], y[N];
+        memset(x, 0, sizeof(x));
+        x[unit] = 1;
+        // π
+        for (int i = 0; i < N; i++) {
+            y[i] = x[i] ^ x[(i + 3) % N] ^ x[(i + 8) % N];
+        }
+        // ρ
+        for (int i = 0; i < N; i++) {
+            x[i] = y[(12 * i) % N];
+        }
+        for (int i = 0; i < N; i++) {
+            M[i][unit] = x[i];
+        }
+    }
+    return M;
+}
+
+static void freeLinearMatrix(int** M) {
+    for (int i = 0; i < N; i++) free(M[i]);
+    free(M);
+}
+
+/* 构建 256x256 单比特传播矩阵（8 个 M 的 Kronecker 积） */
+static void build_Mj_3rd(double Mj[DIM][DIM],
+    const int v[8], const int u[8],
+    int ii, int jj) {
+    int v_sum = 0, u_sum = 0;
+    for (int k = 0; k < 8; k++) {
+        v_sum ^= v[k];
+        u_sum ^= u[k];
+    }
+
+    int bits[8][2];   /* [k][0]=λ0, [k][1]=λ1 */
+    bits[0][0] = (v_sum && (jj == (ii + 1) % N)) ? 1 : 0;
+    bits[0][1] = u_sum;
+    if (jj == ii) bits[0][1] ^= v_sum;
+    for (int k = 1; k < 8; k++) {
+        bits[k][0] = (v[k] && (jj == (ii + 1) % N)) ? 1 : 0;
+        bits[k][1] = u[k];
+        if (jj == ii) bits[k][1] ^= v[k];
+    }
+
+    const double* M[8];
+    for (int k = 0; k < 8; k++) {
+        int idx = bits[k][0] * 2 + bits[k][1];
+        M[k] = MT[idx];
+    }
+
+    memset(Mj, 0, DIM * DIM * sizeof(double));
+    for (int a0 = 0; a0 < 2; a0++) {
+        for (int b0 = 0; b0 < 2; b0++) {
+            double m0 = M[0][a0 * 2 + b0];
+            for (int a1 = 0; a1 < 2; a1++) {
+                for (int b1 = 0; b1 < 2; b1++) {
+                    double m01 = m0 * M[1][a1 * 2 + b1];
+                    for (int a2 = 0; a2 < 2; a2++) {
+                        for (int b2 = 0; b2 < 2; b2++) {
+                            double m012 = m01 * M[2][a2 * 2 + b2];
+                            for (int a3 = 0; a3 < 2; a3++) {
+                                for (int b3 = 0; b3 < 2; b3++) {
+                                    double m0123 = m012 * M[3][a3 * 2 + b3];
+                                    for (int a4 = 0; a4 < 2; a4++) {
+                                        for (int b4 = 0; b4 < 2; b4++) {
+                                            double m01234 = m0123 * M[4][a4 * 2 + b4];
+                                            for (int a5 = 0; a5 < 2; a5++) {
+                                                for (int b5 = 0; b5 < 2; b5++) {
+                                                    double m012345 = m01234 * M[5][a5 * 2 + b5];
+                                                    for (int a6 = 0; a6 < 2; a6++) {
+                                                        for (int b6 = 0; b6 < 2; b6++) {
+                                                            double m0123456 = m012345 * M[6][a6 * 2 + b6];
+                                                            for (int a7 = 0; a7 < 2; a7++) {
+                                                                for (int b7 = 0; b7 < 2; b7++) {
+                                                                    double m7 = M[7][a7 * 2 + b7];
+                                                                    int row = (a0 << 7) | (a1 << 6) | (a2 << 5) | (a3 << 4) |
+                                                                        (a4 << 3) | (a5 << 2) | (a6 << 1) | a7;
+                                                                    int col = (b0 << 7) | (b1 << 6) | (b2 << 5) | (b3 << 4) |
+                                                                        (b4 << 3) | (b5 << 2) | (b6 << 1) | b7;
+                                                                    Mj[row][col] = m0123456 * m7;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* 三阶 χ 层传播（原始截断条件） */
+static void passChi_3rd(const double* gamma, double* sigma) {
+    int ii;
+#pragma omp parallel for schedule(dynamic) private(ii)
+    for (ii = 0; ii < N; ii++) {
+        double(*T)[DIM] = malloc(DIM * DIM * sizeof(double));
+        double(*Mj)[DIM] = malloc(DIM * DIM * sizeof(double));
+        double(*temp)[DIM] = malloc(DIM * DIM * sizeof(double));
+        double(*newT)[DIM] = malloc(DIM * DIM * sizeof(double));
+        if (!T || !Mj || !temp || !newT) {
+            fprintf(stderr, "Memory allocation failed\n");
+            exit(1);
+        }
+
+        for (int v0 = 0; v0 < 2; v0++) {
+            for (int v1 = 0; v1 < 2; v1++) {
+                for (int v2 = 0; v2 < 2; v2++) {
+                    for (int v3 = 0; v3 < 2; v3++) {
+                        for (int v4 = 0; v4 < 2; v4++) {
+                            for (int v5 = 0; v5 < 2; v5++) {
+                                for (int v6 = 0; v6 < 2; v6++) {
+                                    for (int v7 = 0; v7 < 2; v7++) {
+                                        int v[8] = { v0, v1, v2, v3, v4, v5, v6, v7 };
+                                        int v_idx = (v0 << 7) | (v1 << 6) | (v2 << 5) | (v3 << 4) |
+                                            (v4 << 3) | (v5 << 2) | (v6 << 1) | v7;
+
+                                        // T 初始化为单位矩阵
+                                        memset(T, 0, DIM * DIM * sizeof(double));
+                                        for (int k = 0; k < DIM; k++) T[k][k] = 1.0;
+
+                                        for (int jj = 0; jj < N; jj++) {
+                                            memset(temp, 0, DIM * DIM * sizeof(double));
+                                            for (int u_idx = 0; u_idx < DIM; u_idx++) {
+                                                double w = gamma[jj * DIM + u_idx];
+                                                // 原始截断条件
+                                                if (fabs(w) < 1e-15) continue;
+
+                                                int u[8];
+                                                u[0] = (u_idx >> 7) & 1;
+                                                u[1] = (u_idx >> 6) & 1;
+                                                u[2] = (u_idx >> 5) & 1;
+                                                u[3] = (u_idx >> 4) & 1;
+                                                u[4] = (u_idx >> 3) & 1;
+                                                u[5] = (u_idx >> 2) & 1;
+                                                u[6] = (u_idx >> 1) & 1;
+                                                u[7] = u_idx & 1;
+
+                                                build_Mj_3rd(Mj, v, u, ii, jj);
+
+                                                for (int r = 0; r < DIM; r++)
+                                                    for (int c = 0; c < DIM; c++)
+                                                        temp[r][c] += w * Mj[r][c];
+                                            }
+                                            // T = temp @ T
+                                            memset(newT, 0, DIM * DIM * sizeof(double));
+                                            for (int r = 0; r < DIM; r++)
+                                                for (int k = 0; k < DIM; k++)
+                                                    if (fabs(temp[r][k]) > 1e-15)
+                                                        for (int c = 0; c < DIM; c++)
+                                                            newT[r][c] += temp[r][k] * T[k][c];
+                                            memcpy(T, newT, DIM * DIM * sizeof(double));
+                                        }
+
+                                        // 二次型提取
+                                        double sum = 0.0;
+                                        const double e[2][2] = { {1.0, 0.0}, {0.0, 1.0} };
+                                        for (int i0 = 0; i0 < 2; i0++)
+                                            for (int i1 = 0; i1 < 2; i1++)
+                                                for (int i2 = 0; i2 < 2; i2++)
+                                                    for (int i3 = 0; i3 < 2; i3++)
+                                                        for (int i4 = 0; i4 < 2; i4++)
+                                                            for (int i5 = 0; i5 < 2; i5++)
+                                                                for (int i6 = 0; i6 < 2; i6++)
+                                                                    for (int i7 = 0; i7 < 2; i7++) {
+                                                                        double E_vec[DIM];
+                                                                        for (int idx = 0; idx < DIM; idx++) {
+                                                                            int b0 = (idx >> 7) & 1;
+                                                                            int b1 = (idx >> 6) & 1;
+                                                                            int b2 = (idx >> 5) & 1;
+                                                                            int b3 = (idx >> 4) & 1;
+                                                                            int b4 = (idx >> 3) & 1;
+                                                                            int b5 = (idx >> 2) & 1;
+                                                                            int b6 = (idx >> 1) & 1;
+                                                                            int b7 = idx & 1;
+                                                                            E_vec[idx] = e[i0][b0] * e[i1][b1] * e[i2][b2] * e[i3][b3] *
+                                                                                e[i4][b4] * e[i5][b5] * e[i6][b6] * e[i7][b7];
+                                                                        }
+                                                                        double val = 0.0;
+                                                                        for (int r = 0; r < DIM; r++)
+                                                                            for (int c = 0; c < DIM; c++)
+                                                                                val += E_vec[r] * T[r][c] * E_vec[c];
+                                                                        sum += val;
+                                                                    }
+                                        sigma[ii * DIM + v_idx] = sum;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        free(T); free(Mj); free(temp); free(newT);
+    }
+}
+
+/* 三阶线性层传播 */
+static void passLinear_3rd(const double* gamma, double* sigma, int** M_lin) {
+    int ii;
+#pragma omp parallel for schedule(dynamic) private(ii)
+    for (ii = 0; ii < N; ii++) {
+        for (int v_idx = 0; v_idx < DIM; v_idx++) {
+            int v[8];
+            v[0] = (v_idx >> 7) & 1;
+            v[1] = (v_idx >> 6) & 1;
+            v[2] = (v_idx >> 5) & 1;
+            v[3] = (v_idx >> 4) & 1;
+            v[4] = (v_idx >> 3) & 1;
+            v[5] = (v_idx >> 2) & 1;
+            v[6] = (v_idx >> 1) & 1;
+            v[7] = v_idx & 1;
+
+            double cor = 1.0;
+            for (int jj = 0; jj < N; jj++) {
+                int u_idx = 0;
+                for (int k = 0; k < 8; k++) {
+                    if (M_lin[ii][jj] & v[k])
+                        u_idx |= (1 << (7 - k));
+                }
+                cor *= gamma[jj * DIM + u_idx];
+            }
+            sigma[ii * DIM + v_idx] = cor;
+        }
+    }
+}
+
+/* 三阶初始化 */
+static void init_gamma_3rd(double* gamma, int p1, int p2, int p3) {
+    memset(gamma, 0, N * DIM * sizeof(double));
+    for (int i = 0; i < N; i++) {
+        if (i == p1) {
+            for (int u0 = 0; u0 < 2; u0++) {
+                int idx = (u0 << 7) | (1 << 6) | (1 << 3) | (1 << 2) | 1;
+                gamma[i * DIM + idx] = 1.0;
+            }
+        }
+        else if (i == p2) {
+            for (int u0 = 0; u0 < 2; u0++) {
+                int idx = (u0 << 7) | (1 << 5) | (1 << 3) | (1 << 1) | 1;
+                gamma[i * DIM + idx] = 1.0;
+            }
+        }
+        else if (i == p3) {
+            for (int u0 = 0; u0 < 2; u0++) {
+                int idx = (u0 << 7) | (1 << 4) | (1 << 2) | (1 << 1) | 1;
+                gamma[i * DIM + idx] = 1.0;
+            }
+        }
+        else {
+            for (int u0 = 0; u0 < 2; u0++) {
+                int idx = (u0 << 7);   // 其他比特只有值分量
+                gamma[i * DIM + idx] = 1.0;
+            }
+        }
+        fwt(gamma + i * DIM, DIM);
+        for (int k = 0; k < DIM; k++)
+            gamma[i * DIM + k] /= 2.0;
+    }
+}
+
+int main() {
+    omp_set_num_threads(40);
+    printf("Third-order DL: traversing p3, 5 rounds (original threshold)\n");
+
+    int** M_lin = getLinearMatrix();
+    double* gamma = calloc(N * DIM, sizeof(double));
+    double* sigma = calloc(N * DIM, sizeof(double));
+    if (!gamma || !sigma) {
+        fprintf(stderr, "Memory allocation failed\n");
+        return 1;
+    }
+
+    int p1 = 0, p2 = 32;
+    double global_best = 0.0;
+    int best_p3 = -1, best_outbit = -1;
+
+    for (int p3 = 0; p3 < N; p3++) {
+        if (p3 == p1 || p3 == p2) continue;
+
+        init_gamma_3rd(gamma, p1, p2, p3);
+
+        for (int r = 0; r < 5; r++) {
+            passChi_3rd(gamma, sigma);
+            memcpy(gamma, sigma, N * DIM * sizeof(double));
+            if (r < 4) {
+                passLinear_3rd(gamma, sigma, M_lin);
+                memcpy(gamma, sigma, N * DIM * sizeof(double));
+            }
+        }
+
+        // 查找坐标 127 的最大绝对值
+        double cor_max = 0.0;
+        int outbit = 0;
+        for (int i = 0; i < N; i++) {
+            double val = fabs(gamma[i * DIM + 127]);
+            if (val > cor_max) {
+                cor_max = val;
+                outbit = i;
+            }
+        }
+
+        printf("p3 = %3d  max_cor = %.8f  (output bit %d)\n", p3, cor_max, outbit);
+        if (cor_max > global_best) {
+            global_best = cor_max;
+            best_p3 = p3;
+            best_outbit = outbit;
+        }
+    }
+
+    printf("\nGlobal best: Diff1=[%d] Diff2=[%d] Diff3=[%d] -> output bit %d, cor = %.8f\n",
+        p1, p2, best_p3, best_outbit, global_best);
+
+    free(gamma);
+    free(sigma);
+    freeLinearMatrix(M_lin);
+    return 0;
+}
